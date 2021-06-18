@@ -1,0 +1,859 @@
+#!/usr/bin/perl
+
+
+# OUTSTANDING TASKS
+# -----------------
+#  This script needs more error checking.  It will not fail gracefully if some of the hash values 
+#  are undefined due to SNMP timeouts.  Fix this by creating dummy values for each hash element like "unknown"
+# 
+# This script does not provide output in the format that nagios can use for performance graphing.  
+# This can be fixed up by appending ;;; blah blah blah to the end of the output.
+
+
+
+# CHANGE LOG
+# ----------
+# 2014/07/20	njeffrey	Script created to monitor Netgear ReadyNAS Duo (temperature, disk space, RAID status)
+
+
+
+
+# NOTES
+# -----
+#
+#
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#  This script queries a remote host via SNMP
+#
+#  You will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#      # Define a service to check the Netgear ReadyNAS
+#      # Parameters are SNMP community name
+#      define service {
+#              use                             generic-service
+#              hostgroup_name                  all_readynas
+#              service_description             Netgear ReadyNAS
+#              check_command                   check_readynas!public
+#              }
+#
+#
+#  You will also need a command definition similar to the following in commands.cfg on the nagios server
+#      # 'check_readynas' command definition
+#      # parameters are -H hostname -C snmp_community
+#      define command{
+#              command_name    check_readynas
+#              command_line    $USER1$/check_readynas -H $HOSTADDRESS$ -C $ARG1$
+#              }
+#
+#
+
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskNumber  
+# .1.3.6.1.4.1.4526.18.3.1.1
+# Instance number of the disk entry
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskModel
+# .1.3.6.1.4.1.4526.18.3.1.3
+# The disk drive model name
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskState
+# .1.3.6.1.4.1.4526.18.3.1.4
+# The current state of the disk.  Options are:
+#  0: offline
+#  1: online
+#  ok
+#  not_present
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskTemperature
+# .1.3.6.1.4.1.4526.18.3.1.5
+# temperature of this disk (in Fahrenheit)
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.fanTable.fanEntry.fanNumber
+# .1.3.6.1.4.1.4526.18.4.1.1
+# Instance number of this fan entry
+# 
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.fanTable.fanEntry.fanRPM
+# .1.3.6.1.4.1.4526.18.4.1.2
+# Current speed of this fan (in RPM)
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.temperatureTable.temperatureEntry.temperatureNumber
+# .1.3.6.1.4.1.4526.18.5.1.1
+# Instance number of this temperature probe entry
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.temperatureTable.temperatureEntry.temperatureValue
+# .1.3.6.1.4.1.4526.18.5.1.2
+# temperature of this probe (in Fahrenheit)
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.temperatureTable.temperatureEntry.temperatureStatus
+# .1.3.6.1.4.1.4526.18.5.1.3
+# current temperature status (ok, ???)
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeNumber
+# .1.3.6.1.4.1.4526.18.7.1.1
+# instance number of this volume entry
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeName
+# .1.3.6.1.4.1.4526.18.7.1.2
+# name of the volume 
+# 
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeRAIDLevel
+# .1.3.6.1.4.1.4526.18.7.1.3
+# The RAID level of the volume.
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeStatus
+# .1.3.6.1.4.1.4526.18.7.1.4
+# The severity of the volume.
+#            Possible values:
+#            1: Clean
+#            2: Error
+#           16: Initialized (Normal)
+#           ok              (for Netgear ReadyNAS Duo)
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeSize
+# .1.3.6.1.4.1.4526.18.7.1.5
+# size of the volume in megabytes
+#
+# .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeFreeSpace
+# .1.3.6.1.4.1.4526.18.7.1.6
+# free space on the volume in megabytes
+
+
+
+
+
+
+
+
+
+
+
+
+
+use strict;				#enforce good coding practices
+use Getopt::Long;                       #allow --long-switches to be used as parameters.  Install with: perl -MCPAN -e 'install Getopt::Long'
+
+
+
+# declare variables
+my ($OK,$WARN,$CRITICAL,$UNKNOWN);
+my ($CHECK_NAME,$cmd);
+my ($snmpwalk,$snmpget,$readynas_version,$celsius_or_fahrenheit);
+my ($physical_disk_count,$physical_disk_bays);
+my ($freespace_min_crit,$freespace_min_warn,$temperature_max_warn,$temperature_max_crit);
+my ($disk_temperature,$fan_speed,$probe_temperature,$volume_usage);
+my ($host,$oid,$key,%readynas_disks,%readynas_fans,%readynas_probes,%readynas_volumes);
+my ($community,$temp_min_warn,$temp_min_crit,$temp_max_warn,$temp_max_crit);
+my ($opt_h,$opt_w,$opt_c,$opt_C,$opt_H);
+my ($verbose,$output_details);
+$cmd = "";                                              #initialize variable
+$CHECK_NAME                 = "Netgear ReadyNAS";	#name of nagios check
+$verbose                    = "no";                     #yes/no variable to increase output for debugging
+$temp_min_warn              = 10;			#minimum degrees celsius for warning
+$temp_min_crit              = 5;			#minimum degrees celsius for critical alert
+$temp_max_warn              = 25;			#maximum degrees celsius for warning
+$temp_max_crit              = 30;			#maximum degrees celsius for critical alert
+$community                  = "public";  		#default SNMP community name
+$output_details             = "";			#initialize variable to hold details of script output
+$snmpwalk                   = "/usr/bin/snmpwalk";      #location of binary
+$snmpget                    = "/usr/bin/snmpget";      	#location of binary
+$physical_disk_count        = 0;			#number of physical disks in the NAS device
+$physical_disk_bays         = 0;			#number of drive bays in the NAS device
+$disk_temperature           = "";			#scalar value to hold details of all disks
+$fan_speed                  = "";			#scalar value to hold details of all fans
+$probe_temperature          = "";			#scalar value to hold details of all temperature probes
+$volume_usage               = "";			#scalar value to hold details of all logical volumes
+$freespace_min_crit         = 5;			#critical alert on 5% free space for any logical volume
+$freespace_min_warn         = 10;			#warn alert on 10% free space for any logical volume
+$celsius_or_fahrenheit      = "celsius";		#decide which temperature scale to use (only tested with celsius)
+$temperature_max_warn       = 45;			#degrees celsius to send warning alert
+$temperature_max_crit       = 50;			#degrees celsius to send critical alert
+#
+# Nagios return codes
+#
+$OK=            0;
+$WARN=          1;
+$CRITICAL=      2;
+$UNKNOWN=       3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "C=s" => \$opt_C, "community=s" => \$opt_C, "comm=s" => \$opt_C,
+      "H=s" => \$opt_H, "hostname=s"  => \$opt_H, "host=s" => \$opt_H,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   #
+   if( defined( $opt_h ) ) {
+      print "Nagios plugin for determining filesystem usage. \n";
+      print "Examples: \n";
+      print "   $0 --host=myfiler --community=public \n";
+      print "   $0     -H myfiler          -C public \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   #
+   # If the user did not supply a --community SNMP community string, use "public"
+   #
+   if( defined( $opt_C ) ) {
+      $community = $opt_C;
+   } else {
+      $community = "public";
+   }
+   #
+   # If the user did not supply a --host=??? , generate a warning
+   #
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   } else {
+      print "$CHECK_NAME UNKNOWN - a remote host to check was not provided. Use this syntax: $0 -H hostname -C snmp_community\n";
+      exit $CRITICAL;                                           #exit script
+   }
+   #
+   print "host=$host community=$community \n" if ($verbose eq "yes");
+}                       #end of subroutine
+
+
+
+
+
+sub sanity_checks {
+   #
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   # confirm required binaries exist
+   if ( ! -e "$snmpwalk" ) {
+      print "$CHECK_NAME CRITICAL - cannot find $snmpwalk \n";
+      exit $CRITICAL; 
+   }
+   if ( ! -e "$snmpget" ) {
+      print "$CHECK_NAME CRITICAL - cannot find $snmpget \n";
+      exit $CRITICAL; 
+   }
+}                                           			            	#end of subroutine
+
+
+
+sub get_readynas_version {
+   #
+   #
+   print "running get_readynas_version subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   #
+   # confirm this device is a Netgear ReadyNAS
+   $readynas_version  = "unknown";                             #put in a dummy value
+   $oid = ".1.3.6.1.4.1.4526.18.1.0";                             
+   $cmd = "$snmpwalk -Onq -v 1 -c $community $host $oid";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#open filehandle using command output
+   while (<IN>) {                                                       	#read a line from the command output
+      s/\"//g;                                                          	#get rid of quotation marks
+      if ( /$oid ([0-9\.]+)/ ) {         					#find the version number of the ReadyNAS softwar3
+         $readynas_version  = $1;                                         	#assign value to hash
+         print "   found ReadyNAS version $1 \n" if ($verbose eq "yes");
+      }
+   }                                                                    	#end of while loop
+   close IN;                                                   	         	#close filehandle
+   #
+   if ( $readynas_version eq "unknown" ) { 
+      print "$CHECK_NAME UNKNOWN - model not recognized.  Please confirm this device is a Netgear ReadyNAS \n";
+      exit $UNKNOWN; 
+   }
+}                                           			            	#end of subroutine
+
+
+
+
+sub get_number_of_physical_disks {
+   #
+   # Figure out how many physical disks are present in the NAS device
+   # .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskNumber
+   # .1.3.6.1.4.1.4526.18.3.1.1
+   # 
+   # You will get output similar to:
+   # 1
+   # 2
+   #
+   #
+   print "running get_number_of_physical_disks subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.4526.18.3.1.1";                             
+   $cmd = "$snmpwalk -Onqv -v 1 -c $community $host $oid";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#open filehandle using command output
+   while (<IN>) {                                                       	#read a line from the command output
+      s/\"//g;                                                          	#get rid of quotation marks
+      if ( /^([0-9]+)/ ) {         						#find the instance number of each physical disk
+         $readynas_disks{$1}{instance} = $1;                                   	#assign value to hash
+         print "   found disk $1 \n" if ($verbose eq "yes");
+         $physical_disk_bays++;							#increment counter to figure out total number of drive bays
+      }
+   }                                                                    	#end of while loop
+   close IN;                                                   	         	#close filehandle
+}                                           			            	#end of subroutine
+
+
+
+
+sub get_details_of_physical_disks {
+   #
+   # Get the model number, state, temperature of each physical disk
+   #
+   print "running get_details_of_physical_disks subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   foreach $key (sort keys %readynas_disks) {        				#loop through for each physical disk
+      #
+      # get the disk model type
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskModel
+      $oid = ".1.3.6.1.4.1.4526.18.3.1.3.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking disk model number \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9 \-\.]+)/ ) {  					#find the model number of each physical disk
+            $readynas_disks{$key}{model} = $1;                                 	#assign value to hash
+            print "   found disk $key model $readynas_disks{$key}{model}  \n" if ($verbose eq "yes");
+         }
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the physical disk state
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskState
+      # .1.3.6.1.4.1.4526.18.3.1.4
+      # The current state of the disk.  Options are:
+      #  0: offline
+      #  1: online
+      #  ok
+      #  not_present
+      #
+      $oid = ".1.3.6.1.4.1.4526.18.3.1.4.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking disk state \n"   if ($verbose eq "yes");
+      print "   running command: $cmd \n" if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9_ \-\.]+)/ ) {  					#find the model number of each physical disk
+            $readynas_disks{$key}{state} = $1;                                   	#assign value to hash
+            print "   found disk $key state $readynas_disks{$key}{state}  \n" if ($verbose eq "yes");
+            #
+            $physical_disk_count++ if ( $readynas_disks{$key}{state} eq "ok");	#increment counter for number of installed disks
+         }
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the physical disk temperature (in Fahrenheit)
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.diskTable.diskEntry.diskTemperature
+      # .1.3.6.1.4.1.4526.18.3.1.5
+      #
+      $oid = ".1.3.6.1.4.1.4526.18.3.1.5.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking disk temperature \n"   if ($verbose eq "yes");
+      print "   running command: $cmd \n"       if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([0-9]+)/ ) {	  						#find the temperature of each physical disk
+            $readynas_disks{$key}{temp_f} = $1;                                	#assign value to hash (in fahrenheit)
+            #
+            if ( $readynas_disks{$key}{temp_f} == 0 ) {                         #if Fahrenheit is 0 it means disk is not present 
+               $readynas_disks{$key}{temp_c} = 0; 				#convert fahrenheit to celsius
+            }									#end of if block
+            #
+            if ( $readynas_disks{$key}{temp_f} > 0 ) {                          #if Fahrenheit is above zero a disk exists
+               $readynas_disks{$key}{temp_c} = ( ($readynas_disks{$key}{temp_f} - 32) * 5 / 9 ); #convert fahrenheit to celsius
+               $readynas_disks{$key}{temp_c} = sprintf( "%.1f", $readynas_disks{$key}{temp_c}); 	#truncate to 1 decimal places
+            }									#end of if block
+            #
+            if ( $readynas_disks{$key}{temp_f} < 0 ) {                          #if Fahrenheit is less than zero we probably have a problem
+               $readynas_disks{$key}{temp_c} = ( ($readynas_disks{$key}{temp_f} - 32) * 5 / 9 ); #convert fahrenheit to celsius
+               $readynas_disks{$key}{temp_c} = sprintf( "%.1f", $readynas_disks{$key}{temp_c}); 	#truncate to 1 decimal places
+            }									#end of if block
+            #
+            # figure out if we want to display in celsius or fahrenheit
+            if ( $celsius_or_fahrenheit eq "celsius" ) {
+               $readynas_disks{$key}{temp} = $readynas_disks{$key}{temp_c}
+            }									#end of if block
+            if ( $celsius_or_fahrenheit eq "fahrenheit" ) {
+               $readynas_disks{$key}{temp} = $readynas_disks{$key}{temp_f}
+            }									#end of if block
+            # 
+            print "   found disk $key temperature $readynas_disks{$key}{temp} degrees $celsius_or_fahrenheit \n" if ($verbose eq "yes");
+            #
+            # keep all disk temperatures in a scalar value for easy display later
+            if ( $readynas_disks{$key}{temp} != 0 ) {				#skip disks reporting 0 degrees (disk does not exist)
+               $disk_temperature = "$disk_temperature Disk $key temperature:$readynas_disks{$key}{temp}"; 	#concatenate values
+            }
+         }
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+   }										#end of foreach loop
+}                                           			            	#end of subroutine
+
+
+
+
+
+
+
+
+sub get_number_of_fans {
+   #
+   # Figure out how many physical fans are present in the NAS device
+   # .iso.org.dod.internet.private.enterprises.netgear.nasManager.fanTable.fanEntry.fanNumber
+   # .1.3.6.1.4.1.4526.18.4.1.1
+   # 
+   # You will get output similar to:
+   # 1
+   # 2
+   #
+   #
+   print "running get_number_of_fans subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.4526.18.4.1.1";                             
+   $cmd = "$snmpwalk -Onqv -v 1 -c $community $host $oid";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#open filehandle using command output
+   while (<IN>) {                                                       	#read a line from the command output
+      s/\"//g;                                                          	#get rid of quotation marks
+      if ( /^([0-9]+)/ ) {         						#find the instance number of each physical fan
+         $readynas_fans{$1}{instance} = $1;                                   	#assign value to hash
+         print "   found fan $1 \n" if ($verbose eq "yes");
+      }
+   }                                                                    	#end of while loop
+   close IN;                                                   	         	#close filehandle
+}                                           			            	#end of subroutine
+
+
+
+
+sub get_details_of_fans {
+   #
+   # Get the RPM of each physical fan
+   #
+   print "running get_details_of_fans subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   foreach $key (sort keys %readynas_fans) {        				#loop through for each physical fan
+      #
+      # get the speed of each fan
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.fanTable.fanEntry.fanRPM
+      $oid = ".1.3.6.1.4.1.4526.18.4.1.2.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking fan speed for fan $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9 \-\.]+)/ ) {  					#find the model number of each physical disk
+            $readynas_fans{$key}{rpm} = $1;                                 	#assign value to hash
+            print "   found fan $key speed $readynas_fans{$key}{rpm} RPM  \n" if ($verbose eq "yes");
+            # keep all fan temperatures in a scalar value for easy display later
+            $fan_speed = "$fan_speed Fan $key speed:$readynas_fans{$key}{rpm}RPM"; 	#concatenate values
+         }
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+   } 										#end of foreach loop
+}                                           			            	#end of subroutine
+
+
+
+
+
+
+
+
+
+sub get_number_of_temperature_probes {
+   #
+   # Figure out how many physical temperature probes are present in the NAS device
+   # .iso.org.dod.internet.private.enterprises.netgear.nasManager.temperatureTable.temperatureEntry.temperatureNumber
+   # .1.3.6.1.4.1.4526.18.5.1.1
+   # 
+   # You will get output similar to:
+   # 1
+   # 2
+   #
+   #
+   print "running get_number_of_temperature_probes subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.4526.18.5.1.1";                             
+   $cmd = "$snmpwalk -Onqv -v 1 -c $community $host $oid";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#open filehandle using command output
+   while (<IN>) {                                                       	#read a line from the command output
+      s/\"//g;                                                          	#get rid of quotation marks
+      if ( /^([0-9]+)/ ) {         						#find the instance number of each physical fan
+         $readynas_probes{$1}{instance} = $1;                                   	#assign value to hash
+         print "   found temperature probe $1 \n" if ($verbose eq "yes");
+      }
+   }                                                                    	#end of while loop
+   close IN;                                                   	         	#close filehandle
+}                                           			            	#end of subroutine
+
+
+
+
+
+sub get_details_of_temperature_probes {
+   #
+   # Get the temperature reading from each temperature probe
+   #
+   print "running get_details_of_temperature_probes subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   foreach $key (sort keys %readynas_probes) {        				#loop through for each physical fan
+      #
+      # get the temperature reading from each temperature probe
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.temperatureTable.temperatureEntry.temperatureValue
+      $oid = ".1.3.6.1.4.1.4526.18.5.1.2.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking temperature reading on probe $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([0-9]+)/ ) {  							#find the temperature reported by this probe
+            $readynas_probes{$key}{temp_f} = $1;                               	#value is reported in Fahrenheit
+            $readynas_probes{$key}{temp_c} = ( ($readynas_probes{$key}{temp_f} - 32) * 5 / 9 ); #convert fahrenheit to celsius
+            $readynas_probes{$key}{temp_c} = sprintf( "%.1f", $readynas_probes{$key}{temp_c}); 	#truncate to 1 decimal places
+            #
+            # figure out if we want to display in celsius or fahrenheit
+            if ( $celsius_or_fahrenheit eq "celsius" ) {
+               $readynas_probes{$key}{temp} = $readynas_probes{$key}{temp_c}
+            }									#end of if block
+            if ( $celsius_or_fahrenheit eq "fahrenheit" ) {
+               $readynas_probes{$key}{temp} = $readynas_probes{$key}{temp_f}
+            }									#end of if block
+            print "   found temperature probe $key reading $readynas_probes{$key}{temp} degrees $celsius_or_fahrenheit \n" if ($verbose eq "yes");
+         }									#end of if block
+         # keep all temperature probe readings in a scalar value for easy display later
+         $probe_temperature = "$probe_temperature Temperature probe $key:$readynas_probes{$key}{temp}"; 	#concatenate values
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the temperature status (ok or not ok) from each temperature probe
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.temperatureTable.temperatureEntry.temperatureStatus
+      $oid = ".1.3.6.1.4.1.4526.18.5.1.3.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking temperature status on probe $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9. ]+)/ ) {  							#find the temperature reported by this probe
+            $readynas_probes{$key}{status} = $1;                               	#
+            print "   found temperature probe $key status $readynas_probes{$key}{status}  \n" if ($verbose eq "yes");
+         }									#end of if block
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+   } 										#end of foreach loop
+}                                           			            	#end of subroutine
+
+
+
+
+
+
+sub get_number_of_logical_volumes {
+   #
+   # Figure out how many logical RAID volumes present in the NAS device
+   # .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeNumber
+   # .1.3.6.1.4.1.4526.18.7.1.1
+   # 
+   # You will get output similar to:
+   # 1
+   # 2
+   #
+   #
+   print "running get_number_of_logical_volumes subroutine \n" if ($verbose eq "yes");
+   #
+   $oid = ".1.3.6.1.4.1.4526.18.7.1.1";                             
+   $cmd = "$snmpwalk -Onqv -v 1 -c $community $host $oid";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   	#open filehandle using command output
+   while (<IN>) {                                                       	#read a line from the command output
+      s/\"//g;                                                          	#get rid of quotation marks
+      if ( /^([0-9]+)/ ) {         						#find the instance number of each physical fan
+         $readynas_volumes{$1}{instance} = $1;                                   	#assign value to hash
+         print "   found raid volume $1 \n" if ($verbose eq "yes");
+      }
+   }                                                                    	#end of while loop
+   close IN;                                                   	         	#close filehandle
+}                                           			            	#end of subroutine
+
+
+
+
+
+
+
+
+
+
+
+sub get_details_of_logical_volumes {
+   #
+   # Get the RAID status of each logical volume, free space, used space, etc
+   #
+   print "running get_details_of_logical_volumes subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   foreach $key (sort keys %readynas_volumes) {        				#loop through for each physical fan
+      #
+      #
+      # get the name of each logical volume
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeName
+      $oid = ".1.3.6.1.4.1.4526.18.7.1.2.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking name on logical volume $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9 _\.\-]+)/ ) {  							#find the temperature reported by this probe
+            $readynas_volumes{$key}{name} = $1;                               	#value is reported in Fahrenheit
+            print "   found $readynas_volumes{$key}{name}  \n" if ($verbose eq "yes");
+         }									#end of if block
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the RAID level of each logical volume
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeRAIDLevel
+      $oid = ".1.3.6.1.4.1.4526.18.7.1.3.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking RAID level on logical volume $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9. ]+)/ ) {  						#find the raid level of this logical volume
+            $readynas_volumes{$key}{raidlevel} = $1;                               	#
+            print "   found RAID level $readynas_volumes{$key}{raidlevel}  \n" if ($verbose eq "yes");
+         }									#end of if block
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the RAID level of each logical volume
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeStatus
+      # The severity of the volume.
+      #            Possible values:
+      #            1: Clean
+      #            2: Error
+      #           16: Initialized (Normal)
+      #           ok
+      #
+      $oid = ".1.3.6.1.4.1.4526.18.7.1.4.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking status of logical volume $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([a-zA-Z0-9. ]+)/ ) {  						#find the status of this logical volume
+            $readynas_volumes{$key}{status} = $1;                               	#
+            print "   found status $readynas_volumes{$key}{status}  \n" if ($verbose eq "yes");
+         }									#end of if block
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the total size in megabytes of each logical volume
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeSize
+      #
+      $oid = ".1.3.6.1.4.1.4526.18.7.1.5.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking total size of logical volume $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([0-9]+)/ ) { 	 						#find the size of this logical volume
+            $readynas_volumes{$key}{total_mb} = $1;                            	#save value to hash
+            $readynas_volumes{$key}{total_tb} = $readynas_volumes{$key}{total_mb} / 1024 / 1024;		#convert MB to TB
+            $readynas_volumes{$key}{total_tb} = sprintf( "%.2f", $readynas_volumes{$key}{total_tb}); 	#truncate to 2 decimal places
+            print "   found $readynas_volumes{$key}{name} size $readynas_volumes{$key}{total_tb} TB  \n" if ($verbose eq "yes");
+         }									#end of if block
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # get the free space in megabytes of each logical volume
+      # .iso.org.dod.internet.private.enterprises.netgear.nasManager.volumeTable.volumeEntry.volumeFreeSpace
+      #
+      $oid = ".1.3.6.1.4.1.4526.18.7.1.6.$key";                             
+      $cmd = "$snmpget -Onqv -v 1 -c $community $host $oid";
+      print "   checking free space of logical volume $key \n" if ($verbose eq "yes");
+      print "   running command: $cmd \n"      if ($verbose eq "yes");
+      open(IN,"$cmd |");                                                   	#open filehandle using command output
+      while (<IN>) {                                                       	#read a line from the command output
+         s/\"//g;                                                          	#get rid of quotation marks
+         if ( /([0-9]+)/ ) { 	 						#find the size of this logical volume
+            $readynas_volumes{$key}{free_mb} = $1;                            	#save value to hash
+            $readynas_volumes{$key}{free_tb} = $readynas_volumes{$key}{free_mb} / 1024 / 1024;		#convert MB to TB
+            $readynas_volumes{$key}{free_tb} = sprintf( "%.2f", $readynas_volumes{$key}{free_tb}); 	#truncate to 2 decimal places
+            print "   found $readynas_volumes{$key}{name} free space $readynas_volumes{$key}{free_tb} TB  \n" if ($verbose eq "yes");
+         }									#end of if block
+      }                                                                    	#end of while loop
+      close IN;                                                	         	#close filehandle
+      #
+      #
+      # The SNMP MIB does not keep track of the used space on each logical volume.
+      # No problem, we will calculate the used space ourselves.
+      $readynas_volumes{$key}{used_mb} = $readynas_volumes{$key}{total_mb} - $readynas_volumes{$key}{free_mb};
+      $readynas_volumes{$key}{used_mb} = sprintf( "%.2f", $readynas_volumes{$key}{used_mb}); 	#truncate to 2 decimal places
+      $readynas_volumes{$key}{used_tb} = $readynas_volumes{$key}{total_tb} - $readynas_volumes{$key}{free_tb};
+      $readynas_volumes{$key}{used_tb} = sprintf( "%.2f", $readynas_volumes{$key}{used_tb}); 	#truncate to 2 decimal places
+      #
+      # Calculate the percentages of used and free disk space (ie convert from bytes to percentages)
+      $readynas_volumes{$key}{used_pct} = $readynas_volumes{$key}{used_mb} * 100 / $readynas_volumes{$key}{total_mb};
+      $readynas_volumes{$key}{free_pct} = 100 - ($readynas_volumes{$key}{used_mb} * 100 / $readynas_volumes{$key}{total_mb});
+      $readynas_volumes{$key}{used_pct} = sprintf( "%.2f", $readynas_volumes{$key}{used_pct}); 	#truncate to 2 decimal places
+      $readynas_volumes{$key}{free_pct} = sprintf( "%.2f", $readynas_volumes{$key}{free_pct}); 	#truncate to 2 decimal places
+      #
+      print "   found $readynas_volumes{$key}{name} used space $readynas_volumes{$key}{used_tb} TB  \n" if ($verbose eq "yes");
+      #
+      #
+      $volume_usage = "$volume_usage  Logical volume $readynas_volumes{$key}{name} $readynas_volumes{$key}{used_pct}% full ($readynas_volumes{$key}{used_tb}/$readynas_volumes{$key}{total_tb} TB)";         #concatenate values
+
+   } 										#end of foreach loop
+}                                           			            	#end of subroutine
+
+
+
+
+
+
+
+
+
+
+
+sub print_output {
+   #
+   # print output in the format expected by nagios
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   $output_details = "ReadyNAS version:$readynas_version    Drive bays:$physical_disk_bays  Installed disks:$physical_disk_count  $disk_temperature  $probe_temperature   $fan_speed  $volume_usage   ";
+   #
+   #
+   #
+   if ( $physical_disk_bays < 1 ) {
+      print "$CHECK_NAME WARN - $physical_disk_bays drive bays detected.   $output_details \n";
+      exit $WARN; 
+   }
+   if ( $physical_disk_count < 1 ) {
+      print "$CHECK_NAME WARN - $physical_disk_count physical disks detected.   $output_details \n";
+      exit $WARN; 
+   }
+   foreach $key (sort keys %readynas_disks) {
+      if ( $readynas_disks{$key}{temp} < 0 ) {
+         print "$CHECK_NAME WARN - Received bogus disk temperature reading of $readynas_disks{$key}{temp} degrees $celsius_or_fahrenheit.  $output_details\n";
+         exit $WARN; 
+      }
+   }
+   foreach $key (sort keys %readynas_probes) {
+      if ( $readynas_probes{$key}{temp} > $temperature_max_crit ) { 
+         print "$CHECK_NAME CRITICAL - High temperature reading of $readynas_probes{$key}{temp} degrees $celsius_or_fahrenheit.  $output_details\n";
+         exit $CRITICAL; 
+      }
+   }
+   foreach $key (sort keys %readynas_probes) {
+      if ( $readynas_probes{$key}{temp} > $temperature_max_warn ) { 
+         print "$CHECK_NAME WARN - High temperature reading of $readynas_probes{$key}{temp} degrees $celsius_or_fahrenheit.  $output_details\n";
+         exit $WARN; 
+      }
+   }
+   foreach $key (sort keys %readynas_probes) {
+      if ( $readynas_probes{$key}{temp} < 0 ) {
+         print "$CHECK_NAME WARN - Received bogus temperature probe reading.  $output_details \n";
+         exit $WARN; 
+      }
+   }
+   foreach $key (sort keys %readynas_volumes) {
+      if ( $readynas_volumes{$key}{free_pct} < $freespace_min_crit ) {
+         print "$CHECK_NAME CRITICAL - $readynas_volumes{$key}{name} logical volume is $readynas_volumes{$key}{used_pct}% full.    $output_details \n";
+         exit $CRITICAL; 
+      }
+   }
+   foreach $key (sort keys %readynas_volumes) {
+      if ( $readynas_volumes{$key}{free_pct} < $freespace_min_warn ) {
+         print "$CHECK_NAME WARN - $readynas_volumes{$key}{name} logical volume is $readynas_volumes{$key}{used_pct}% full.    $output_details \n";
+         exit $UNKNOWN; 
+      }
+   }
+   foreach $key (sort keys %readynas_volumes) {
+      if ( $readynas_volumes{$key}{status} ne "ok" ) {
+         print "$CHECK_NAME WARN - logical volume $readynas_volumes{$key}{name} has status $readynas_volumes{$key}{status}.    $output_details \n";
+         exit $UNKNOWN; 
+      }
+   }
+   foreach $key (sort keys %readynas_probes) {
+      if ( $readynas_probes{$key}{status} ne "ok" ) {
+         print "$CHECK_NAME WARN - temperature probe $readynas_probes{$key}{instance} has status $readynas_probes{$key}{status}.    $output_details \n";
+         exit $UNKNOWN; 
+      }
+   }
+   #foreach $key (sort keys %readynas_probes) {
+      #if ( $readynas_probes{$key}{status} eq "unknown" ) {
+      #   print "$CHECK_NAME CRITICAL - Could not determine temperature.  Please check the temperature probe. $output_details \n";
+      #   exit $CRITICAL; 
+      #}
+   #}
+   # 
+   # 
+   # 
+   # This message gets sent if everything is ok
+   print "$CHECK_NAME OK - $output_details \n";
+   exit $OK;
+}                                                                       #end of subroutine
+
+
+
+
+
+# --------------------------- main body of program ----------------------
+get_options;
+sanity_checks;
+get_readynas_version;
+get_number_of_physical_disks;
+get_details_of_physical_disks;
+get_number_of_fans;
+get_details_of_fans;
+get_number_of_temperature_probes;
+get_details_of_temperature_probes;
+get_number_of_logical_volumes;
+get_details_of_logical_volumes;
+print_output;
+
